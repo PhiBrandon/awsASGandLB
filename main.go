@@ -20,14 +20,6 @@ func catchError(err error) {
 
 func main() {
 
-	/*
-		We need to specify data to be passed into the AMI?
-		We didn't get the expected web service running when we got to the Autoscaling group...
-		Auto Scaling groups come into service quickly! (Less than a second...)
-		When using the RunInstances command, you need to specify a min/max count
-		When creating a security group, need to specify a description.
-
-	*/
 	// Create an EC2 instance that has a web service running
 
 	// Create service configuration
