@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/autoscaling"
 	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/aws/aws-sdk-go/service/elbv2"
 )
 
 func catchError(err error) {
@@ -64,17 +66,6 @@ func main() {
 	securityGroupOutput, err := svc.CreateSecurityGroup(&ec2.CreateSecurityGroupInput{
 		GroupName:   aws.String("SimpleHttpService"),
 		Description: aws.String("Simple HTTP Security Group"),
-		TagSpecifications: []*ec2.TagSpecification{
-			&ec2.TagSpecification{
-				ResourceType: aws.String("security-group"),
-				Tags: []*ec2.Tag{
-					&ec2.Tag{
-						Key:   aws.String("Name"),
-						Value: aws.String("simpleServerSG"),
-					},
-				},
-			},
-		},
 	})
 	catchError(err)
 	securityGroupID := aws.String(*securityGroupOutput.GroupId)
@@ -165,6 +156,7 @@ func main() {
 		},
 	})
 	instanceAZ := *describeSubnetOutput.Subnets[0].AvailabilityZone
+	instanceVPC := *describeSubnetOutput.Subnets[0].VpcId
 
 	// Crete AMI from running instance
 	createAmiOutput, err := svc.CreateImage(&ec2.CreateImageInput{
@@ -200,6 +192,7 @@ func main() {
 			},
 			KeyName:      aws.String(keyName),
 			InstanceType: aws.String("t2.micro"),
+			UserData:     aws.String(userData),
 		},
 	})
 	catchError(err)
@@ -228,11 +221,120 @@ func main() {
 	catchError(err)
 	fmt.Println("Autoscaling group is in service!")
 
-	describeInstancesOutput, err := svc.DescribeInstances(&ec2.DescribeInstancesInput{})
+	fmt.Println("Waiting 20 seconds to check instances...")
+	time.Sleep(20 * time.Second)
+
+	fmt.Println("Getting Autoscaling instances")
+	describeAutoScalingInstances, err := autoScalingSvc.DescribeAutoScalingInstances(&autoscaling.DescribeAutoScalingInstancesInput{})
 	catchError(err)
-	for _, a := range describeInstancesOutput.Reservations {
-		for _, instance := range a.Instances {
-			fmt.Println(instance.State.String())
+	asgInstances := describeAutoScalingInstances.AutoScalingInstances
+
+	var asgInstancesSlice []*elbv2.TargetDescription
+	for _, instance := range asgInstances {
+		targetDescription := &elbv2.TargetDescription{
+			Id:   aws.String(*instance.InstanceId),
+			Port: aws.Int64(80),
 		}
+		asgInstancesSlice = append(asgInstancesSlice, targetDescription)
 	}
+
+	fmt.Println("Creating Elastic Load balancer instance.")
+
+	// Create Elastic Load Balance Service
+	//
+	//
+	//
+	// Get all the vpc Subnets
+	describeVPCSubnets, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+		Filters: []*ec2.Filter{
+			&ec2.Filter{
+				Name: aws.String("vpc-id"),
+				Values: []*string{
+					aws.String(instanceVPC),
+				},
+			},
+		},
+	})
+	var subnetIDs []*string
+	subnets := describeVPCSubnets.Subnets
+	for _, a := range subnets {
+		subnetID := a.SubnetId
+		subnetIDs = append(subnetIDs, subnetID)
+	}
+	elbSvc := elbv2.New(sess)
+
+	// Create Load Balancer
+	createLoadBalanceOutput, err := elbSvc.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
+		Name: aws.String("simpleHTTPServerELB"),
+		SecurityGroups: []*string{
+			securityGroupID,
+		},
+		Subnets: subnetIDs,
+		Type:    aws.String("application"),
+	})
+	catchError(err)
+	loadBalancerARN := *createLoadBalanceOutput.LoadBalancers[0].LoadBalancerArn
+
+	fmt.Println("Waiting for loadbalancer to be avialable...")
+	err = elbSvc.WaitUntilLoadBalancerAvailable(&elbv2.DescribeLoadBalancersInput{
+		LoadBalancerArns: []*string{
+			aws.String(loadBalancerARN),
+		},
+	})
+	fmt.Println("Load balancer is available!")
+
+	// Create Target group
+	fmt.Println("Creating Target group...")
+	createTargetGroupOutput, err := elbSvc.CreateTargetGroup(&elbv2.CreateTargetGroupInput{
+		HealthCheckPath: aws.String("/"),
+		VpcId:           aws.String(instanceVPC),
+		Name:            aws.String("simpleHTTPTargetGroup"),
+		TargetType:      aws.String("instance"),
+		Port:            aws.Int64(80),
+		Protocol:        aws.String("HTTP"),
+	})
+	catchError(err)
+	targetGroupARN := *createTargetGroupOutput.TargetGroups[0].TargetGroupArn
+
+	//Check to see if registerd instances are running...
+
+	var instanceStrings []*string
+	for _, a := range asgInstances {
+		iID := a.InstanceId
+		instanceStrings = append(instanceStrings, iID)
+	}
+	fmt.Println("Checking if instances are in running state...")
+	err = svc.WaitUntilInstanceRunning(&ec2.DescribeInstancesInput{
+		InstanceIds: instanceStrings,
+	})
+	fmt.Println("Instances are running!!!")
+
+	fmt.Println("Registering target group to the elastic load balancer.")
+	registertargetOutput, err := elbSvc.RegisterTargets(&elbv2.RegisterTargetsInput{
+		TargetGroupArn: aws.String(targetGroupARN),
+		Targets:        asgInstancesSlice,
+	})
+	catchError(err)
+	fmt.Println(registertargetOutput.GoString())
+
+	fmt.Println("Creating Listener...")
+	createListenerOutput, err := elbSvc.CreateListener(&elbv2.CreateListenerInput{
+		DefaultActions: []*elbv2.Action{
+			&elbv2.Action{
+				TargetGroupArn: aws.String(targetGroupARN),
+				Type:           aws.String("forward"),
+			},
+		},
+		LoadBalancerArn: aws.String(loadBalancerARN),
+		Port:            aws.Int64(80),
+		Protocol:        aws.String("HTTP"),
+	})
+	fmt.Println(createListenerOutput.GoString())
+
+	fmt.Println("Waiting for Targets to be in service...")
+	err = elbSvc.WaitUntilTargetInService(&elbv2.DescribeTargetHealthInput{
+		TargetGroupArn: aws.String(targetGroupARN),
+		Targets:        asgInstancesSlice,
+	})
+	fmt.Println("Targets are in service!")
 }
